@@ -5,9 +5,10 @@ import numpy as np
 import utils
 import model as modellib
 from config import Config
-
+import skimage.io
 import visualize
 from keras import utils  as k_utils
+import random
 
 ROOT_DIR = os.getcwd()
 
@@ -29,7 +30,7 @@ class HuaxiConfig(Config):
 
     # We use a GPU with 12GB memory, which can fit two images.
     # Adjust down if you use a smaller GPU.
-    IMAGES_PER_GPU = 2
+    IMAGES_PER_GPU = 3
 
     # Uncomment to train on 8 GPUs (default is 1)
     GPU_COUNT = 1
@@ -163,6 +164,24 @@ def test_format():
                 print(image_path)
 
 
+def test_generator(generator, init_epoch=0, epochs=2, steps_per_epoch=100):
+    epoch = init_epoch
+    output_generator = generator
+
+    while epoch < epochs:
+        print("Training in epoch: {:3}/{}:".format(epoch + 1, int(epochs)))
+        steps_done = 0
+        batch_index = 0
+        while steps_done < steps_per_epoch:
+            print("Step: {:3}/{}".format(steps_done + 1, int(steps_per_epoch)))
+            generator_output = next(output_generator)
+            steps_done += 1
+        epoch += 1
+
+    # generator = modellib.vale_data_generator(huaxi_train, config=config, batch_size=3)
+    # test_generator(generator, 0, epochs=5, steps_per_epoch=huaxi_train.num_images / 3)
+
+
 if __name__ == '__main__':
     # load train and test data
     train_data_dir = "/Users/moubinhao/programStaff/huaxi_data"
@@ -170,7 +189,7 @@ if __name__ == '__main__':
 
     huaxi_train = HuaxiDataset()
     huaxi_train.load_huaxi(train_data_dir, 'train', "json")
-    huaxi_train.load_huaxi(test_data_dir, 'test', 'others')
+    # huaxi_train.load_huaxi(test_data_dir, 'test', 'others')
     huaxi_train.prepare()
     huaxi_train.to_string()
     # x_train, y_train = huaxi_train.load_data('train')
@@ -191,6 +210,7 @@ if __name__ == '__main__':
     #     x_train_mean = np.mean(x_train, axis=0)
     #     x_train -= x_train_mean
     #
+
     # print('x_train shape', x_train.shape)
     # print('y_train shape', y_train.shape)
     # print('x_test shape', x_test.shape)
@@ -205,30 +225,30 @@ if __name__ == '__main__':
     # import test
 
     #
-    # config = Config()
-    # config.MAX_GT_INSTANCES = 1
-    # config.display()
-    # train_generator = test.data_generator(huaxi_train, config, batch_size=1, shuffle=False)
-    # input = next(train_generator)
-    # print(input, "input ....................")
-    # print(next(train_generator))
-    # print("num_images_epoch", huaxi_train.num_images)
-    # for i in range(20):
-    #     print("index ", i)
-    #     next(train_generator)
-    #
     # list = huaxi_train.image_info[0]['class_id']
     # list = np.array(list, dtype=np.int32)
-    # print(type(list))
+    # print(type(list))huaxi_test.num_images
     # print(np.any(list > 0))
 
     # Directory to save logs and trained model
     MODEL_DIR = os.path.join(ROOT_DIR, "logs")
     config = HuaxiConfig()
-    # config.display()
+    # # config.display()
     model = modellib.Resnet(mode='training', config=config, model_dir=MODEL_DIR)
     model.train(train_dataset=huaxi_train,
                 val_dataset=huaxi_test,
                 learning_rate=config.LEARNING_RATE,
                 epochs=2,
-                layers=None)
+                layers=None, )
+
+    # model = modellib.Resnet(mode='reference', config=config, model_dir=MODEL_DIR)
+    # model.load_weights('/Users/moubinhao/PycharmProjects/tensorflow_keras/logs/huaxi20181025T1001/ResNet29v2_0001.h5')
+    #
+    # IMAGE_DIR = '/Users/moubinhao/programStaff/huaxi_data/img'
+    # file_names = next(os.walk(IMAGE_DIR))[2][:2]
+    # print(file_names)
+    # print(len(file_names))
+    # print(random.choice(file_names))
+    # image = skimage.io.imread(os.path.join(IMAGE_DIR, random.choice(file_names)))
+    # results = model.predict([image], verbose=1)
+    # print(results)
