@@ -18,6 +18,24 @@ import utils
 import datetime
 import keras.layers as KL
 import re
+import multiprocessing
+
+
+############################################################
+#  Utility Functions
+############################################################
+
+def log(text, array=None):
+    """Prints a text message. And, optionally, if a Numpy array is provided it
+    prints it's shape, min, and max values.
+    """
+    if array is not None:
+        text = text.ljust(25)
+        text += ("shape: {:20}  min: {:10.5f}  max: {:10.5f}".format(
+            str(array.shape),
+            array.min() if array.size else "",
+            array.max() if array.size else ""))
+    print(text)
 
 
 class Resnet():
@@ -59,15 +77,98 @@ class Resnet():
             else:
                 model = resnet_v1(input_shape=input_shape, depth=config.NETWORK_DEPTH)
         else:
-            # TO-DO for inference model
-            pass
+            # inference model
+            if config.VERSION == 2:
+                model = resnet_v2(input_shape=input_shape, depth=config.NETWORK_DEPTH)
+            else:
+                model = resnet_v1(input_shape=input_shape, depth=config.NETWORK_DEPTH)
+            # predict
 
         # Add multi-GPU support
         if config.GPU_COUNT > 1:
-            from parallel_model import ParallenlModel
-            model = ParallenlModel(model, config.GPU_COUNT)
+            from parallel_model import ParallelModel
+            model = ParallelModel(model, config.GPU_COUNT)
 
         return model
+
+    def predict(self, image, verbose=0):
+
+        assert self.mode == "inference", "Create model in inference mode."
+
+        predict_class = self.keras_model.predict(image, verbose=0)
+
+        return predict_class
+
+    def mold_inputs(self, images):
+        """Takes a list of images and modifies them to the format expected
+        as an input to the neural network.
+        images: List of image matricies [height,width,depth]. Images can have
+            different sizes.
+
+        Returns 3 Numpy matricies:
+        molded_images: [N, h, w, 3]. Images resized and normalized.
+        image_metas: [N, length of meta data]. Details about each image.
+        windows: [N, (y1, x1, y2, x2)]. The portion of the image that has the
+            original image (padding excluded).
+        """
+        molded_images = []
+        image_metas = []
+        for image in images:
+            # Resize image to fit the model expected size
+            # TODO: move resizing to mold_image()
+            molded_image, window, scale, padding = utils.resize_image(
+                image,
+                min_dim=self.config.IMAGE_MIN_DIM,
+                max_dim=self.config.IMAGE_MAX_DIM,
+                padding=self.config.IMAGE_PADDING)
+            molded_image = mold_image(molded_image, self.config)
+            # Build image_meta
+            image_meta = compose_image_meta(
+                0, image.shape,
+                np.zeros([self.config.NUM_CLASSES], dtype=np.int32))
+            # Append
+            molded_images.append(molded_image)
+            image_metas.append(image_meta)
+        # Pack into arrays
+        molded_images = np.stack(molded_images)
+        image_metas = np.stack(image_metas)
+        return molded_images, image_metas
+
+    def predict(self, images, verbose=0):
+        """Runs the detection pipeline.
+
+        images: List of images, potentially of different sizes.
+
+        Returns a list of dicts, one dict per image. The dict contains:
+        rois: [N, (y1, x1, y2, x2)] detection bounding boxes
+        class_ids: [N] int class IDs
+        scores: [N] float probability scores for the class IDs
+        masks: [H, W, N] instance binary masks
+        """
+        assert self.mode == "inference", "Create model in inference mode."
+        print(len(images), " -", self.config.BATCH_SIZE)
+        assert len(
+            images) == self.config.BATCH_SIZE, "len(images) must be equal to BATCH_SIZE"
+
+        if verbose:
+            log("Processing {} images".format(len(images)))
+            for image in images:
+                log("image", image)
+        # Mold inputs to format expected by the neural network
+        molded_images, image_metas = self.mold_inputs(images)
+        if verbose:
+            log("molded_images", molded_images)
+            log("image_metas", image_metas)
+            # Run object detection
+        classes = self.keras_model.predict([molded_images], verbose=0)
+
+        # Process detections
+        results = []
+        for i, image in enumerate(images):
+            results.append({
+                "class_ids": classes[i],
+            })
+        return results
 
     def compile(self, learning_rate):
         """Gets the model ready for training. Adds losses, regularization, and
@@ -82,6 +183,44 @@ class Resnet():
         self.keras_model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
         self.keras_model.summary()
+
+    def load_weights(self, filepath, by_name=False, exclude=None):
+        """Modified version of the correspoding Keras function with
+        the addition of multi-GPU support and the ability to exclude
+        some layers from loading.
+        exlude: list of layer names to excluce
+        """
+        import h5py
+        from keras.engine import saving
+
+        if exclude:
+            by_name = True
+
+        if h5py is None:
+            raise ImportError('`load_weights` requires h5py.')
+        f = h5py.File(filepath, mode='r')
+        if 'layer_names' not in f.attrs and 'model_weights' in f:
+            f = f['model_weights']
+
+        # In multi-GPU training, we wrap the model. Get layers
+        # of the inner model because they have the weights.
+        keras_model = self.keras_model
+        layers = keras_model.inner_model.layers if hasattr(keras_model, "inner_model") \
+            else keras_model.layers
+
+        # Exclude some layers
+        if exclude:
+            layers = filter(lambda l: l.name not in exclude, layers)
+
+        if by_name:
+            saving.load_weights_from_hdf5_group_by_name(f, layers)
+        else:
+            saving.load_weights_from_hdf5_group(f, layers)
+        if hasattr(f, 'close'):
+            f.close()
+
+        # Update the log directory
+        # self.set_log_dir(filepath)
 
     def set_log_dir(self, model_path=None):
         """Sets the model log directory and epoch counter.
@@ -173,89 +312,41 @@ class Resnet():
         ]
 
         # Train
-        # Run training, with or without data augmentation.
-        print('Not using data augmentation.')
+
+        # Work-around for Windows: Keras fails on Windows when using
+        # multiprocessing workers. See discussion here:
+        # https://github.com/matterport/Mask_RCNN/issues/13#issuecomment-353124009
         if os.name is 'nt':
             workers = 0
         else:
-            workers = max(self.config.BATCH_SIZE // 2, 2)
+            workers = multiprocessing.cpu_count()
 
-        if not self.config.DATA_AUGMENTATION:
+        self.keras_model.fit_generator(
+            train_gernerator,
+            epochs=epochs,
+            steps_per_epoch=train_dataset.num_images / self.config.BATCH_SIZE,
+            callbacks=callbacks,
+            validation_data=val_generator,
+            validation_steps=val_dataset.num_images / self.config.BATCH_SIZE,
+            # validation_steps=9,
+            max_queue_size=100,
+            # 使用主线程，此时数据循环的次数在调试时 = epochs， 而如果workers > 0, 使用的多线程,调试结果不对, 如works = 2,
+            # 最大后一张图片在调试时会多出现两次, 这可能是多线程的问题，不晓得是不是错误
+            workers=workers,
+            use_multiprocessing=True,
+            initial_epoch=self.epoch,
+            verbose=1
+        )
+        self.epoch = max(self.epoch, epochs)
 
-            self.keras_model.fit_generator(
-                train_gernerator,
-                epochs=epochs,
-                # steps_per_epoch=self.config.STEPS_PER_EPOCH,
-                steps_per_epoch=6,
-                callbacks=callbacks,
-                # validation_data=val_generator,
-                # validation_steps=self.config.VALIDATION_STEPS,
-                # validation_steps=9,
-                # max_queue_size=100,
-                workers=workers,
-                # use_multiprocessing=True,
-                # initial_epoch=epochs,
-                verbose=1
-            )
-            self.epoch = max(self.epoch, epochs)
-        else:
-            print('Using real-time data augmentation.')
-            # This will do preprocessing and realtime data augmentation:
-            datagen = ImageDataGenerator(
-                # set input mean to 0 over the dataset
-                featurewise_center=False,
-                # set each sample mean to 0
-                samplewise_center=False,
-                # divide inputs by std of dataset
-                featurewise_std_normalization=False,
-                # divide each input by its std
-                samplewise_std_normalization=False,
-                # apply ZCA whitening
-                zca_whitening=False,
-                # epsilon for ZCA whitening
-                zca_epsilon=1e-06,
-                # randomly rotate images in the range (deg 0 to 180)
-                rotation_range=0,
-                # randomly shift images horizontally
-                width_shift_range=0.1,
-                # randomly shift images vertically
-                height_shift_range=0.1,
-                # set range for random shear
-                shear_range=0.,
-                # set range for random zoom
-                zoom_range=0.,
-                # set range for random channel shifts
-                channel_shift_range=0.,
-                # set mode for filling points outside the input boundaries
-                fill_mode='nearest',
-                # value used for fill_mode = "constant"
-                cval=0.,
-                # randomly flip images
-                horizontal_flip=True,
-                # randomly flip images
-                vertical_flip=False,
-                # set rescaling factor (applied before any other transformation)
-                rescale=None,
-                # set function that will be applied on each input
-                preprocessing_function=None,
-                # image data format, either "channels_first" or "channels_last"
-                data_format=None,
-                # fraction of images reserved for validation (strictly between 0 and 1)
-                validation_split=0.0)
-
-            # Compute quantities required for featurewise normalization
-            # (std, mean, and principal components if ZCA whitening is applied).
-            datagen.fit(train_gernerator)
-
-            # Fit the model on the batches generated by datagen.flow().
-            self.keras_model.fit_generator(train_gernerator,
-                                           validation_data=next(val_generator),
-                                           verbose=1,
-                                           workers=workers,
-                                           callbacks=callbacks,
-                                           initial_epoch=epochs,
-                                           )
-            self.epoch = max(self.epoch, epochs)
+        scores = self.keras_model.evaluate_generator(val_generator,
+                                                     steps=val_dataset.num_images / self.config.BATCH_SIZE,
+                                                     max_queue_size=10,
+                                                     workers=1,
+                                                     use_multiprocessing=False,
+                                                     verbose=0)
+        print('Test loss:', scores[0])
+        print('Test accuracy:', scores[1])
 
 
 def lr_schedule(epoch):
@@ -479,11 +570,9 @@ def resnet_v2(input_shape, depth, num_classes=2):
     x = Activation('relu')(x)
     x = AveragePooling2D(pool_size=8)(x)
     y = Flatten()(x)
-    print(y.shape, "flattent().shape")
     outputs = Dense(num_classes,
                     activation='softmax',
                     kernel_initializer='he_normal')(y)
-    print(outputs.shape, "outputs_shape..................")
     # Instantiate model.
     model = Model(inputs=inputs_image, outputs=outputs)
     return model
@@ -521,11 +610,12 @@ def load_image_gt(dataset, config, image_id, augment=False):
     image = dataset.load_image(image_id)
     class_ids = dataset.image_info[image_id]['class_id']
     shape = image.shape
-    image, window, scale, padding = utils.resize_image(
+    image, window, scale, padding, crop = utils.resize_image(
         image,
         min_dim=config.IMAGE_MIN_DIM,
+        min_scale=config.IMAGE_MIN_SCALE,
         max_dim=config.IMAGE_MAX_DIM,
-        padding=config.IMAGE_PADDING)
+        mode=config.IMAGE_RESIZE_MODE)
 
     # Random horizontal flips.
     if augment:
@@ -568,13 +658,12 @@ def compose_image_meta(image_id, image_shape, active_class_ids):
     return meta
 
 
-def mold_image(images):
+def mold_image(images, config):
     """Takes RGB images with 0-255 values and subtraces
     the mean pixel and converts it to float. Expects image
     colors in RGB order.
     """
-    mean_pixel = np.array([123.7, 116.8, 103.9])
-    return images.astype(np.float32) - mean_pixel
+    return images.astype(np.float32) - config.MEAN_PIXEL
 
 
 def data_generator(dataset, config, shuffle=True, augment=True, batch_size=1):
@@ -598,7 +687,8 @@ def data_generator(dataset, config, shuffle=True, augment=True, batch_size=1):
     - gt_class_ids: [batch, MAX_GT_INSTANCES] Integer class IDs
 
     """
-    print("batch_size = ", batch_size)
+    # print("batch_size = ", batch_size)
+    # print("dataset.num_images", dataset.num_images)
     b = 0  # batch item index
     image_index = -1
     image_ids = np.copy(dataset.image_ids)
@@ -610,7 +700,7 @@ def data_generator(dataset, config, shuffle=True, augment=True, batch_size=1):
             # Increment index to pick next image. Shuffle if at the start of an epoch.
             # image_index = [0, 1, 2, 3, .....len(image_ids), 0, 1, 2,......]
             image_index = (image_index + 1) % len(image_ids)
-            # print("image_index", image_index)
+            # print("train : image_index", image_index)
             if shuffle and image_index == 0:
                 # print("shuffling image_ids............")
                 np.random.shuffle(image_ids)
@@ -619,12 +709,12 @@ def data_generator(dataset, config, shuffle=True, augment=True, batch_size=1):
             image_id = image_ids[image_index]
 
             image, image_meta, gt_class_ids = load_image_gt(dataset, config, image_id, augment=augment)
-            # print("image[{:2}].shape = {}".format(image_id, image.shape))
-            # print("image_meta.lens= {}, gt_class_ids = {}".format(len(image_meta), gt_class_ids))
+            # print("image[{:2}].shape = {}".format(image_id, image.shape), " train, train, train")
+            # print("image_meta.lens= {}, gt_class_ids = {}".format(len(image_meta), gt_class_ids), "train, train, train")
             # print("image_meta", image_meta)
             gt_class_ids = np.array(gt_class_ids, dtype=np.int32)
             gt_class_ids = keras.utils.to_categorical(gt_class_ids, config.NUM_CLASSES)
-            # print("gt_class_ids", gt_class_ids)
+            # print("gt_class_ids", gt_class_ids, "train, train, train")
 
             # Init batch arrays
             if b == 0:
@@ -642,19 +732,111 @@ def data_generator(dataset, config, shuffle=True, augment=True, batch_size=1):
             # Add to batch
             batch_image_meta[b] = image_meta
 
-            batch_images[b] = mold_image(image.astype(np.float32))
+            batch_images[b] = mold_image(image.astype(np.float32), config)
             batch_gt_class_ids[b, :gt_class_ids.shape[1]] = gt_class_ids
 
+            # print("***********{:3}/{:3}".format(b + 1, batch_size),
+            #       "add to batch_iamge in train,train,train ****************")
             b += 1
-
             # Batch full?
             if b >= batch_size:
-                inputs = [batch_images, batch_image_meta, batch_gt_class_ids]
+                # inputs = [batch_images, batch_image_meta, batch_gt_class_ids]
+                # print("*********batch full in  trian, train, trian *********........")
                 # print("out put of generator ---batch_iamges = ", type(batch_images), batch_images.shape)
                 # print("out put of generator ---batch_gt_class_ids = ", type(batch_gt_class_ids), batch_gt_class_ids)
                 yield [batch_images, batch_gt_class_ids]
                 # start a new batch
-                # print("Bach ", b)
+                b = 0
+        except (GeneratorExit, KeyboardInterrupt):
+            raise
+        except:
+            # Log it and skip the image
+            print("Error processing image {}".format(
+                dataset.image_info[image_id]))
+            error_count += 1
+            if error_count > 5:
+                raise
+
+
+def vale_data_generator(dataset, config, shuffle=True, augment=True, batch_size=1):
+    """
+    A generator that returns images and corresponding target class ids,
+    bounding box deltas, and masks.
+
+    dataset: The Dataset object to pick data from
+    config: The model config object
+    shuffle: If True, shuffles the samples before every epoch
+    augment: If True, applies image augmentation to images (currently only
+             horizontal flips are supported)
+    batch_size: How many images to return in each call
+
+
+    Returns a Python generator. Upon calling next() on it, the
+    generator return a list:
+    inputs list:
+    - images: [batch, H, W, C]
+    - image_meta: [batch, size of image meta]
+    - gt_class_ids: [batch, MAX_GT_INSTANCES] Integer class IDs
+
+    """
+    print("batch_size = ", batch_size)
+    print("dataset.num_images", dataset.num_images)
+    b = 0  # batch item index
+    image_index = -1
+    image_ids = np.copy(dataset.image_ids)
+    error_count = 0
+
+    # Keras requires a generator to run indefinately.
+    while True:
+        try:
+            # Increment index to pick next image. Shuffle if at the start of an epoch.
+            # image_index = [0, 1, 2, 3, .....len(image_ids), 0, 1, 2,......]
+            image_index = (image_index + 1) % len(image_ids)
+            print("val : image_index", image_index)
+            if shuffle and image_index == 0:
+                # print("shuffling image_ids............")
+                np.random.shuffle(image_ids)
+
+            # Get GT bounding boxes and masks for image.
+            image_id = image_ids[image_index]
+
+            image, image_meta, gt_class_ids = load_image_gt(dataset, config, image_id, augment=augment)
+            # print("image[{:2}].shape = {}".format(image_id, image.shape), "val, val, val")
+            # print("image_meta.lens= {}, gt_class_ids = {}".format(len(image_meta), gt_class_ids), "val,val,val")
+            # print("image_meta", image_meta)
+            gt_class_ids = np.array(gt_class_ids, dtype=np.int32)
+            gt_class_ids = keras.utils.to_categorical(gt_class_ids, config.NUM_CLASSES)
+            # print("gt_class_ids", gt_class_ids, "val, val,val ")
+
+            # Init batch arrays
+            if b == 0:
+                batch_image_meta = np.zeros(
+                    (batch_size,) + image_meta.shape, dtype=image_meta.dtype)
+                batch_images = np.zeros(
+                    (batch_size,) + image.shape, dtype=np.float32)
+
+                # 这里MAX_GT_INSTANCE本来是考虑分割的情形，对应图片有多个区域（配置里是100，即一张图片最多有100个区域）
+                # 但用在分类时，这个值就要取成num_classes, 而且batch_gt_class_ids里的值还必须是one_hot的
+
+                batch_gt_class_ids = np.zeros(
+                    (batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
+
+            # Add to batch
+            batch_image_meta[b] = image_meta
+
+            batch_images[b] = mold_image(image.astype(np.float32), config)
+            batch_gt_class_ids[b, :gt_class_ids.shape[1]] = gt_class_ids
+
+            # print("***********{:3}/{:3}".format(b+1, batch_size), "add to batch_iamge in val, val ,val ****************")
+            b += 1
+            # Batch full?
+            if b >= batch_size:
+                inputs = [batch_images, batch_image_meta, batch_gt_class_ids]
+                print("**********val, val,val .....batch full..**************")
+                print("out put of generator ---batch_iamges = ", type(batch_images), batch_images.shape)
+                # print("out put of generator ---batch_gt_class_ids = ", type(batch_gt_class_ids), batch_gt_class_ids)
+                yield [batch_images, batch_gt_class_ids]
+                # start a new batch
                 b = 0
         except (GeneratorExit, KeyboardInterrupt):
             raise
