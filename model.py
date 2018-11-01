@@ -666,99 +666,33 @@ def mold_image(images, config):
     return images.astype(np.float32) - config.MEAN_PIXEL
 
 
+def load_data(dataset, config, shuffle=True):
+    """Loads image
+    # Returns
+        Tuple of Numpy arrays: `(x_train, y_train) or (x_test, y_test)`.
+    """
+    num_sample = dataset.num_images
+    x = np.empty((num_sample, config.IMAGE_MAX_DIM, config.IMAGE_MAX_DIM, 3), dtype='uint8')
+    y = np.empty((num_sample,), dtype='uint8')
+
+    # shuffle image index before read image.
+    if shuffle:
+        image_ids = np.copy(dataset.image_ids)
+        np.random.shuffle(image_ids)
+    for index, image_id in enumerate(image_ids):
+        image = dataset.load_image(image_id)
+        image = utils.resize_image(image, min_dim=config.IMAGE_MIN_DIM, max_dim=config.IMAGE_MAX_DIM)[0]
+        x[index] = image
+        # print(self.image_info[image_id]['class_id'])
+        # 由于之前考虑了多区域，所以class_id是个数组，这里只取第一个
+        # print(self.image_info[image_id]['class_id'])
+        y[index] = dataset.image_info[image_id]['class_id'][0]
+
+    y = np.reshape(y, (len(y), 1))
+    return (x, y)
+
+
 def data_generator(dataset, config, shuffle=True, augment=True, batch_size=1):
-    """
-    A generator that returns images and corresponding target class ids,
-    bounding box deltas, and masks.
-
-    dataset: The Dataset object to pick data from
-    config: The model config object
-    shuffle: If True, shuffles the samples before every epoch
-    augment: If True, applies image augmentation to images (currently only
-             horizontal flips are supported)
-    batch_size: How many images to return in each call
-
-
-    Returns a Python generator. Upon calling next() on it, the
-    generator return a list:
-    inputs list:
-    - images: [batch, H, W, C]
-    - image_meta: [batch, size of image meta]
-    - gt_class_ids: [batch, MAX_GT_INSTANCES] Integer class IDs
-
-    """
-    # print("batch_size = ", batch_size)
-    # print("dataset.num_images", dataset.num_images)
-    b = 0  # batch item index
-    image_index = -1
-    image_ids = np.copy(dataset.image_ids)
-    error_count = 0
-
-    # Keras requires a generator to run indefinately.
-    while True:
-        try:
-            # Increment index to pick next image. Shuffle if at the start of an epoch.
-            # image_index = [0, 1, 2, 3, .....len(image_ids), 0, 1, 2,......]
-            image_index = (image_index + 1) % len(image_ids)
-            # print("train : image_index", image_index)
-            if shuffle and image_index == 0:
-                # print("shuffling image_ids............")
-                np.random.shuffle(image_ids)
-
-            # Get GT bounding boxes and masks for image.
-            image_id = image_ids[image_index]
-
-            image, image_meta, gt_class_ids = load_image_gt(dataset, config, image_id, augment=augment)
-            # print("image[{:2}].shape = {}".format(image_id, image.shape), " train, train, train")
-            # print("image_meta.lens= {}, gt_class_ids = {}".format(len(image_meta), gt_class_ids), "train, train, train")
-            # print("image_meta", image_meta)
-            gt_class_ids = np.array(gt_class_ids, dtype=np.int32)
-            gt_class_ids = keras.utils.to_categorical(gt_class_ids, config.NUM_CLASSES)
-            # print("gt_class_ids", gt_class_ids, "train, train, train")
-
-            # Init batch arrays
-            if b == 0:
-                batch_image_meta = np.zeros(
-                    (batch_size,) + image_meta.shape, dtype=image_meta.dtype)
-                batch_images = np.zeros(
-                    (batch_size,) + image.shape, dtype=np.float32)
-
-                # 这里MAX_GT_INSTANCE本来是考虑分割的情形，对应图片有多个区域（配置里是100，即一张图片最多有100个区域）
-                # 但用在分类时，这个值就要取成num_classes, 而且batch_gt_class_ids里的值还必须是one_hot的
-
-                batch_gt_class_ids = np.zeros(
-                    (batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
-
-            # Add to batch
-            batch_image_meta[b] = image_meta
-
-            batch_images[b] = mold_image(image.astype(np.float32), config)
-            batch_gt_class_ids[b, :gt_class_ids.shape[1]] = gt_class_ids
-
-            # print("***********{:3}/{:3}".format(b + 1, batch_size),
-            #       "add to batch_iamge in train,train,train ****************")
-            b += 1
-            # Batch full?
-            if b >= batch_size:
-                # inputs = [batch_images, batch_image_meta, batch_gt_class_ids]
-                # print("*********batch full in  trian, train, trian *********........")
-                # print("out put of generator ---batch_iamges = ", type(batch_images), batch_images.shape)
-                # print("out put of generator ---batch_gt_class_ids = ", type(batch_gt_class_ids), batch_gt_class_ids)
-                yield [batch_images, batch_gt_class_ids]
-                # start a new batch
-                b = 0
-        except (GeneratorExit, KeyboardInterrupt):
-            raise
-        except:
-            # Log it and skip the image
-            print("Error processing image {}".format(
-                dataset.image_info[image_id]))
-            error_count += 1
-            if error_count > 5:
-                raise
-
-
-def vale_data_generator(dataset, config, shuffle=True, augment=True, batch_size=1):
     """
     A generator that returns images and corresponding target class ids,
     bounding box deltas, and masks.
@@ -792,7 +726,7 @@ def vale_data_generator(dataset, config, shuffle=True, augment=True, batch_size=
             # Increment index to pick next image. Shuffle if at the start of an epoch.
             # image_index = [0, 1, 2, 3, .....len(image_ids), 0, 1, 2,......]
             image_index = (image_index + 1) % len(image_ids)
-            print("val : image_index", image_index)
+            # print("val : image_index", image_index)
             if shuffle and image_index == 0:
                 # print("shuffling image_ids............")
                 np.random.shuffle(image_ids)
@@ -803,38 +737,31 @@ def vale_data_generator(dataset, config, shuffle=True, augment=True, batch_size=
             image, image_meta, gt_class_ids = load_image_gt(dataset, config, image_id, augment=augment)
             # print("image[{:2}].shape = {}".format(image_id, image.shape), "val, val, val")
             # print("image_meta.lens= {}, gt_class_ids = {}".format(len(image_meta), gt_class_ids), "val,val,val")
-            # print("image_meta", image_meta)
-            gt_class_ids = np.array(gt_class_ids, dtype=np.int32)
-            gt_class_ids = keras.utils.to_categorical(gt_class_ids, config.NUM_CLASSES)
-            # print("gt_class_ids", gt_class_ids, "val, val,val ")
-
+            # print(type(gt_class_ids))
             # Init batch arrays
             if b == 0:
                 batch_image_meta = np.zeros(
                     (batch_size,) + image_meta.shape, dtype=image_meta.dtype)
                 batch_images = np.zeros(
                     (batch_size,) + image.shape, dtype=np.float32)
-
-                # 这里MAX_GT_INSTANCE本来是考虑分割的情形，对应图片有多个区域（配置里是100，即一张图片最多有100个区域）
-                # 但用在分类时，这个值就要取成num_classes, 而且batch_gt_class_ids里的值还必须是one_hot的
-
+                # len(gt_class_ids) should be 1
                 batch_gt_class_ids = np.zeros(
-                    (batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
+                    (batch_size, len(gt_class_ids)), dtype=np.int32)
 
             # Add to batch
             batch_image_meta[b] = image_meta
 
             batch_images[b] = mold_image(image.astype(np.float32), config)
-            batch_gt_class_ids[b, :gt_class_ids.shape[1]] = gt_class_ids
-
-            # print("***********{:3}/{:3}".format(b+1, batch_size), "add to batch_iamge in val, val ,val ****************")
+            batch_gt_class_ids[b, :] = gt_class_ids
+            # print("***********{:3}/{:3}".format(b+1, batch_size), "add to batch_iamge in val, val ,val****************")
             b += 1
             # Batch full?
             if b >= batch_size:
                 inputs = [batch_images, batch_image_meta, batch_gt_class_ids]
-                print("**********val, val,val .....batch full..**************")
-                print("out put of generator ---batch_iamges = ", type(batch_images), batch_images.shape)
-                # print("out put of generator ---batch_gt_class_ids = ", type(batch_gt_class_ids), batch_gt_class_ids)
+                batch_gt_class_ids = keras.utils.to_categorical(batch_gt_class_ids, config.NUM_CLASSES)
+                # print("**********val, val,val .....batch full..**************")
+                # print("out put of generator ---batch_iamges = ", type(batch_images), batch_images.shape)
+                print("out put of generator ---batch_gt_class_ids = ", type(batch_gt_class_ids), batch_gt_class_ids)
                 yield [batch_images, batch_gt_class_ids]
                 # start a new batch
                 b = 0
