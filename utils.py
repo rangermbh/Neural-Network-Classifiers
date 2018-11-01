@@ -236,4 +236,4 @@ if __name__ == '__main__':
     dataset.add_class("huaxi", 1, 'optimum')
     dataset.add_image("huaxi", "elephant", "/Users/moubinhao/PycharmProjects/tensorflow_keras/elephant")
     dataset.to_string()
-    #dataset.load_image(0)
+    dataset.load_image(0)
